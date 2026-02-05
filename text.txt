@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>French Drill</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 16px; }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    button, input, textarea { font-size: 16px; padding: 10px; }
+    input { flex: 1; min-width: 220px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; margin: 12px 0; }
+    .fr { font-size: 28px; font-weight: 650; margin: 0 0 6px; }
+    .en { color:#444; margin: 0 0 10px; }
+    .msg { margin-top: 10px; }
+    .tabs button { border-radius: 10px; border:1px solid #ddd; background:#fff; }
+    .tabs button.active { border-color:#000; }
+    small { color:#666; }
+    .pill { font-size: 12px; border:1px solid #ddd; padding:4px 8px; border-radius:999px; }
+  </style>
+</head>
+<body>
+  <h2>French Drill</h2>
+
+  <div class="row tabs">
+    <button id="tabToday" class="active">Today</button>
+    <button id="tabReview">Review</button>
+    <button id="tabWords">Words</button>
+  </div>
+
+  <div id="view"></div>
+
+<script>
+/** -----------------------------
+ *  Data + storage
+ *  ----------------------------- */
+const LS_KEY = "french_drill_v1";
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function loadState() {
+  const raw = localStorage.getItem(LS_KEY);
+  if (raw) return JSON.parse(raw);
+
+  // Default starter pack (edit in Words tab)
+  const starter = [
+    { fr:"bonjour", en:"hello" },
+    { fr:"merci", en:"thank you" },
+    { fr:"s’il vous plaît", en:"please" },
+    { fr:"ça vous va ?", en:"does that work for you?" },
+    { fr:"plus court", en:"shorter" },
+    { fr:"plus long", en:"longer" },
+    { fr:"les côtés", en:"the sides" },
+    { fr:"devant", en:"front" },
+    { fr:"derrière", en:"back" },
+    { fr:"comme ça", en:"like that" },
+    { fr:"aujourd’hui", en:"today" },
+    { fr:"demain", en:"tomorrow" },
+    { fr:"maintenant", en:"now" },
+    { fr:"j’ai faim", en:"I’m hungry" },
+    { fr:"j’ai soif", en:"I’m thirsty" },
+    { fr:"je dois y aller", en:"I have to go" }
+  ].map(w => ({
+    id: crypto.randomUUID(),
+    fr: w.fr,
+    en: w.en,
+    stage: 0,
+    nextDue: Date.now(),
+    stats: { correct: 0, wrong: 0 }
+  }));
+
+  return {
+    words: starter,
+    todayIds: [],
+    todayDate: "",
+    settings: {
+      dailyCount: 10,
+      accentStrictStage: 3, // stage >= 3 requires accents
+      ttsLang: "fr-FR"
+    }
+  };
+}
+
+function saveState() {
+  localStorage.setItem(LS_KEY, JSON.stringify(state));
+}
+
+let state = loadState();
+
+/** -----------------------------
+ *  Helpers
+ *  ----------------------------- */
+function todayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+
+function normalizeLoose(s) {
+  // Lowercase, trim, remove punctuation spacing issues, remove diacritics
+  return (s || "")
+    .toLowerCase()
+    .trim()
+    .replace(/[’']/g, "'")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // strip accents
+    .replace(/[^a-z0-9\s'-]/g, "") // keep basic chars, spaces, apostrophes, hyphens
+    .replace(/\s+/g, " ");
+}
+
+function normalizeStrict(s) {
+  // Lowercase + trim, keep accents (but standardize apostrophe)
+  return (s || "")
+    .toLowerCase()
+    .trim()
+    .replace(/[’]/g, "'")
+    .replace(/\s+/g, " ");
+}
+
+function isCorrect(typed, target, stage) {
+  const strict = stage >= state.settings.accentStrictStage;
+  if (strict) return normalizeStrict(typed) === normalizeStrict(target);
+  return normalizeLoose(typed) === normalizeLoose(target);
+}
+
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i=a.length-1; i>0; i--) {
+    const j = Math.floor(Math.random()*(i+1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+/** -----------------------------
+ *  Spaced repetition schedule
+ *  ----------------------------- */
+const intervalsDaysByStage = [1, 2, 4, 7, 14, 30]; // stage 0..5
+
+function scheduleNext(word, wasCorrect) {
+  if (wasCorrect) {
+    word.stage = Math.min(5, word.stage + 1);
+    word.stats.correct++;
+  } else {
+    word.stage = Math.max(0, word.stage - 1);
+    word.stats.wrong++;
+  }
+  const days = intervalsDaysByStage[word.stage] ?? 1;
+  word.nextDue = Date.now() + days * DAY_MS;
+}
+
+/** -----------------------------
+ *  TTS (tap-to-hear)
+ *  ----------------------------- */
+function speak(frText) {
+  if (!("speechSynthesis" in window)) {
+    alert("Text-to-speech not supported in this browser.");
+    return;
+  }
+  window.speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(frText);
+  u.lang = state.settings.ttsLang; // fr-FR
+  u.rate = 0.95; // slightly slower for learning
+  window.speechSynthesis.speak(u);
+}
+
+/** -----------------------------
+ *  Views
+ *  ----------------------------- */
+const view = document.getElementById("view");
+const tabToday = document.getElementById("tabToday");
+const tabReview = document.getElementById("tabReview");
+const tabWords = document.getElementById("tabWords");
+
+tabToday.onclick = () => { setTab("today"); };
+tabReview.onclick = () => { setTab("review"); };
+tabWords.onclick = () => { setTab("words"); };
+
+function setActive(btn) {
+  [tabToday, tabReview, tabWords].forEach(b => b.classList.remove("active"));
+  btn.classList.add("active");
+}
+
+function setTab(name) {
+  if (name === "today") { setActive(tabToday); renderToday(); }
+  if (name === "review") { setActive(tabReview); renderReview(); }
+  if (name === "words") { setActive(tabWords); renderWords(); }
+}
+
+function ensureTodaySet() {
+  const key = todayKey();
+  if (state.todayDate === key && state.todayIds.length) return;
+
+  // Build today's set from due words first, then others
+  const now = Date.now();
+  const due = state.words.filter(w => w.nextDue <= now);
+  const notDue = state.words.filter(w => w.nextDue > now);
+
+  const pick = [
+    ...shuffle(due),
+    ...shuffle(notDue)
+  ].slice(0, Math.min(state.settings.dailyCount, state.words.length));
+
+  state.todayIds = pick.map(w => w.id);
+  state.todayDate = key;
+  saveState();
+}
+
+function getWordById(id) {
+  return state.words.find(w => w.id === id);
+}
+
+function renderCard(word, contextLabel) {
+  view.innerHTML = `
+    <div class="card">
+      <div class="row" style="justify-content:space-between;">
+        <span class="pill">${contextLabel}</span>
+        <span class="pill">stage ${word.stage}</span>
+      </div>
+
+      <p class="fr">${word.fr}</p>
+      <p class="en">${word.en}</p>
+
+      <div class="row">
+        <button id="btnSpeak">🔊 Hear</button>
+        <input id="typed" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false"
+               placeholder="Type the French…" />
+        <button id="btnCheck">Check</button>
+      </div>
+
+      <div class="row" style="margin-top:10px;">
+        <button id="btnAgain">Again</button>
+        <button id="btnGotIt">Got it</button>
+      </div>
+
+      <div class="msg" id="msg"><small>Tip: for stage 0–2, accents are optional. Stage 3+ requires accents.</small></div>
+    </div>
+  `;
+
+  document.getElementById("btnSpeak").onclick = () => speak(word.fr);
+
+  const typed = document.getElementById("typed");
+  typed.focus();
+
+  const msg = document.getElementById("msg");
+
+  function checkOnly() {
+    const ok = isCorrect(typed.value, word.fr, word.stage);
+    msg.innerHTML = ok
+      ? `<b>✅ Correct.</b> <small>${word.fr}</small>`
+      : `<b>❌ Not quite.</b> <small>Correct: <b>${word.fr}</b></small>`;
+    return ok;
+  }
+
+  document.getElementById("btnCheck").onclick = checkOnly;
+
+  document.getElementById("btnAgain").onclick = () => {
+    // treat as incorrect for scheduling purposes
+    scheduleNext(word, false);
+    saveState();
+    nextStep();
+  };
+
+  document.getElementById("btnGotIt").onclick = () => {
+    const ok = checkOnly();
+    scheduleNext(word, ok);
+    saveState();
+    nextStep();
+  };
+
+  typed.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      document.getElementById("btnGotIt").click();
+    }
+  });
+}
+
+/** Today flow */
+let todayQueue = [];
+function renderToday() {
+  ensureTodaySet();
+  todayQueue = state.todayIds.map(getWordById).filter(Boolean);
+
+  if (!todayQueue.length) {
+    view.innerHTML = `<p>No words yet. Add some in <b>Words</b>.</p>`;
+    return;
+  }
+
+  renderCard(todayQueue[0], `Today • ${state.todayDate}`);
+}
+
+function nextStep() {
+  // Advance within current tab
+  if (tabToday.classList.contains("active")) {
+    todayQueue.shift();
+    if (!todayQueue.length) {
+      view.innerHTML = `
+        <div class="card">
+          <h3>Done for today.</h3>
+          <p>Come back tomorrow, or jump to <b>Review</b> if you want more.</p>
+          <div class="row">
+            <button id="goReview">Go to Review</button>
+            <button id="newToday">Refresh Today Set</button>
+          </div>
+        </div>
+      `;
+      document.getElementById("goReview").onclick = () => setTab("review");
+      document.getElementById("newToday").onclick = () => {
+        state.todayDate = "";
+        state.todayIds = [];
+        saveState();
+        renderToday();
+      };
+      return;
+    }
+    renderCard(todayQueue[0], `Today • ${state.todayDate}`);
+    return;
+  }
+
+  if (tabReview.classList.contains("active")) {
+    renderReview();
+  }
+}
+
+/** Review */
+function renderReview() {
+  const now = Date.now();
+  const due = shuffle(state.words.filter(w => w.nextDue <= now));
+
+  if (!due.length) {
+    view.innerHTML = `
+      <div class="card">
+        <h3>Nothing due right now.</h3>
+        <p>Come back later, or do <b>Today</b>.</p>
+        <button id="goToday">Go to Today</button>
+      </div>
+    `;
+    document.getElementById("goToday").onclick = () => setTab("today");
+    return;
+  }
+
+  renderCard(due[0], `Review • ${due.length} due`);
+}
+
+/** Words */
+function renderWords() {
+  const exportLines = state.words
+    .map(w => `${w.fr} | ${w.en}`)
+    .join("\n");
+
+  view.innerHTML = `
+    <div class="card">
+      <h3>Word List</h3>
+      <p><small>Format: <b>French | English</b> (one per line). Paste your own list, then Save.</small></p>
+      <textarea id="bulk" rows="12" style="width:100%;">${exportLines}</textarea>
+
+      <div class="row" style="margin-top:10px;">
+        <button id="btnSaveWords">Save</button>
+        <button id="btnResetProgress">Reset Progress</button>
+      </div>
+
+      <div class="row" style="margin-top:10px;">
+        <span class="pill">Total: ${state.words.length}</span>
+        <span class="pill">Daily: ${state.settings.dailyCount}</span>
+        <span class="pill">Accents strict at stage ${state.settings.accentStrictStage}</span>
+      </div>
+    </div>
+  `;
+
+  document.getElementById("btnSaveWords").onclick = () => {
+    const raw = document.getElementById("bulk").value;
+    const lines = raw.split("\n").map(l => l.trim()).filter(Boolean);
+
+    const newWords = [];
+    for (const line of lines) {
+      const parts = line.split("|").map(p => p.trim());
+      if (parts.length < 2) continue;
+      const fr = parts[0];
+      const en = parts.slice(1).join(" | ");
+      if (!fr || !en) continue;
+
+      // Try to match existing by exact French
+      const existing = state.words.find(w => normalizeStrict(w.fr) === normalizeStrict(fr));
+      if (existing) {
+        existing.en = en; // update meaning, keep progress
+        newWords.push(existing);
+      } else {
+        newWords.push({
+          id: crypto.randomUUID(),
+          fr, en,
+          stage: 0,
+          nextDue: Date.now(),
+          stats: { correct: 0, wrong: 0 }
+        });
+      }
+    }
+
+    state.words = newWords;
+    // refresh today's set so it reflects updated list
+    state.todayDate = "";
+    state.todayIds = [];
+    saveState();
+    alert("Saved.");
+  };
+
+  document.getElementById("btnResetProgress").onclick = () => {
+    for (const w of state.words) {
+      w.stage = 0;
+      w.nextDue = Date.now();
+      w.stats = { correct: 0, wrong: 0 };
+    }
+    state.todayDate = "";
+    state.todayIds = [];
+    saveState();
+    alert("Progress reset.");
+  };
+}
+
+/** Boot */
+setTab("today");
+</script>
+</body>
+</html>
